@@ -1,0 +1,13 @@
+[server]
+maxUploadSize = 50
+enableXsrfProtection = true
+enableCORS = true
+headless = true
+address = "127.0.0.1"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "viewer"
+showErrorDetails = "none"

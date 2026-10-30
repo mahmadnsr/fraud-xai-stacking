@@ -1,0 +1,19 @@
+# secrets and keys
+.env
+*.pem
+*.key
+# data (may be sensitive or licensed) - keep only the README
+data/*
+!data/README.md
+# model artifacts (signed with your local key; regenerate with the CLI)
+models/*
+!models/.gitkeep
+# logs
+logs/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.coverage
