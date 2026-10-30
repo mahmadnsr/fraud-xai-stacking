@@ -24,8 +24,8 @@ EXPLAIN_ROWS, BACKGROUND_ROWS = 200, 100
 @dataclass
 class TrainResult:
     version: str
-    metrics: dict          # held-out TEST metrics at the validation-selected threshold
-    metrics_at_half: dict  # same models at threshold 0.5, for reference
+    metrics: dict          
+    metrics_at_half: dict  
     thresholds: dict
     fit_seconds: dict
     splits_info: dict
@@ -36,9 +36,10 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
     X, y = prepare_xy(bundle.frame, bundle.target)
     imb = imbalance_summary(y)
     say(f"Prepared {len(X):,} unique records ({imb['fraud']:,} fraud, imbalance ratio {imb['imbalance_ratio']:.1f}:1)")
+    
     s: Splits = split_data(X, y, cfg.split_strategy, cfg.val_size, cfg.test_size, cfg.seed)
     say(f"Split ({s.strategy}): {s.sizes()} fraud per split: {s.fraud_counts()}")
-    spw = float((s.y_train == 0).sum() / max((s.y_train == 1).sum(), 1))  # from TRAINING data only
+    spw = float((s.y_train == 0).sum() / max((s.y_train == 1).sum(), 1))  
 
     models, fit_seconds = {}, {}
     base = build_base_models(cfg, spw)
@@ -47,10 +48,11 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
         t = time.perf_counter()
         try:
             models[name] = base[name].fit(s.X_train, s.y_train)
-        except Exception as exc:  # surface which model failed, keep diagnostics in the log
+        except Exception as exc:  
             log.exception("training failed for %s", name)
             raise RuntimeError(f"Training failed for {DISPLAY[name]} ({type(exc).__name__}).") from exc
         fit_seconds[name] = time.perf_counter() - t
+        
     say(f"Training stacking ensemble ({cfg.cv_folds}-fold out-of-fold meta-features, Logistic Regression meta-learner) ...")
     t = time.perf_counter()
     try:
@@ -61,7 +63,10 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
     fit_seconds[STACKING_NAME] = time.perf_counter() - t
 
     say("Evaluating on validation (threshold selection) and held-out test data ...")
-    ev, thresholds, metrics, metrics_half = {"y_val": s.y_val.to_numpy(), "y_test": s.y_test.to_numpy()}, {}, {}, {}
+    
+    # FIX: s.y_val and s.y_test are numpy arrays now
+    ev, thresholds, metrics, metrics_half = {"y_val": s.y_val, "y_test": s.y_test}, {}, {}, {}
+    
     for name, m in models.items():
         pv, pt = m.predict_proba(s.X_val)[:, 1], m.predict_proba(s.X_test)[:, 1]
         ev[f"{name}__val"], ev[f"{name}__test"] = pv, pt
@@ -70,23 +75,33 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
         metrics_half[name] = compute_metrics(s.y_test, pt, 0.5)
 
     rng = np.random.default_rng(cfg.seed)
-    bg = s.X_train.sample(min(BACKGROUND_ROWS, len(s.X_train)), random_state=cfg.seed).assign(__part="background")
-    ex = s.X_test.iloc[rng.permutation(len(s.X_test))[:EXPLAIN_ROWS]].assign(__part="explain")
+    
+    # FIX: Handle numpy arrays for explainability background/explain frames
+    feature_names = list(bundle.frame.drop(columns=[bundle.target]).columns)
+    
+    bg_idx = np.random.choice(len(s.X_train), min(BACKGROUND_ROWS, len(s.X_train)), replace=False)
+    bg = pd.DataFrame(s.X_train[bg_idx], columns=feature_names).assign(__part="background")
+    
+    ex_idx = rng.permutation(len(s.X_test))[:EXPLAIN_ROWS]
+    ex = pd.DataFrame(s.X_test[ex_idx], columns=feature_names).assign(__part="explain")
+    
     explain_frame = pd.concat([bg, ex], ignore_index=True)
 
-    desc = X.describe(percentiles=[0.01, 0.5, 0.99]).T
+    # FIX: Use original dataframe for stats since X is scaled numpy array
+    desc = bundle.frame.drop(columns=[bundle.target]).describe(percentiles=[0.01, 0.5, 0.99]).T
+    
     manifest = {
         "project": "Financial Fraud Detection using XAI and Stacking Ensembles",
         "dataset": bundle.provenance(), "target": bundle.target, "final_model": STACKING_NAME,
-        "feature_schema": {"features": list(X.columns), "dtype": "float64"},
+        "feature_schema": {"features": feature_names, "dtype": "float64"},
         "feature_stats": {c: {"min": float(desc.loc[c, "min"]), "p01": float(desc.loc[c, "1%"]), "median": float(desc.loc[c, "50%"]),
-                              "p99": float(desc.loc[c, "99%"]), "max": float(desc.loc[c, "max"])} for c in X.columns},
-        "preprocessing": {"imputer": "median (fit on training data inside each Pipeline)", "scaler": "StandardScaler for Logistic Regression only",
-                          "dedup": "exact duplicates removed before splitting", "imbalance": "class weights / scale_pos_weight, no resampling"},
+                              "p99": float(desc.loc[c, "99%"]), "max": float(desc.loc[c, "max"])} for c in feature_names},
+        "preprocessing": {"imputer": "median", "scaler": "ManualScaler (fit on training data)", 
+                          "dedup": "exact duplicates removed before splitting", "imbalance": "class weights, no resampling"},
         "config": cfg.as_dict(), "split_sizes": s.sizes(), "split_fraud_counts": s.fraud_counts(), "imbalance": imb,
         "model_params": {n: describe_params(m) for n, m in models.items() if n != STACKING_NAME},
-        "stacking": {"base": BASE_MODEL_NAMES, "meta_learner": "LogisticRegression", "stack_method": "predict_proba",
-                     "cv": f"StratifiedKFold({cfg.cv_folds}, shuffle=True, random_state={cfg.seed})", "passthrough": False},
+        "stacking": {"base": BASE_MODEL_NAMES, "meta_learner": "ManualLogisticRegression", "stack_method": "predict_proba",
+                     "cv": f"ManualKFold({cfg.cv_folds}, random_state={cfg.seed})", "passthrough": False},
         "thresholds": thresholds, "threshold_selection": "max F1 on validation set",
         "metrics_test": metrics, "metrics_test_at_0.5": metrics_half,
         "fit_seconds": {k: round(v, 2) for k, v in fit_seconds.items()},
