@@ -1,290 +1,629 @@
-# fraud_xai/manual_ml.py
-import numpy as np
-import pandas as pd
-import copy
+"""Dependency-free, deterministic implementations of core ML algorithms."""
+from __future__ import annotations
 
-# ==========================================
-# 1. MANUAL PREPROCESSING & METRICS
-# ==========================================
+import copy
+import numpy as np
+
+
+def _sigmoid(z):
+    z = np.clip(np.asarray(z, dtype=float), -35.0, 35.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def _validate_xy(X, y):
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if X.ndim != 2 or len(X) != len(y) or not len(y):
+        raise ValueError("X must be a non-empty 2D array aligned with y.")
+    # Missing feature values are imputed by ManualScaler after splitting.
+    # Infinite values and invalid targets are never allowed.
+    if np.isinf(X).any():
+        raise ValueError("Feature data cannot contain infinity.")
+    if not np.isfinite(y).all():
+        raise ValueError("Target data must contain only finite values.")
+    return X, y
+
 
 class ManualScaler:
+    """Median imputation followed by standardisation, fitted on training data only."""
     def fit(self, X):
-        self.mean = np.mean(X, axis=0)
-        self.std = np.std(X, axis=0) + 1e-8
-    def transform(self, X):
-        return (X - self.mean) / self.std
-    def fit_transform(self, X):
-        self.fit(X)
-        return self.transform(X)
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or not len(X):
+            raise ValueError("X must be a non-empty 2D array.")
+        if np.isinf(X).any():
+            raise ValueError("Infinite feature values are not supported.")
+        with np.errstate(all="ignore"):
+            self.median_ = np.nanmedian(X, axis=0)
+        if not np.isfinite(self.median_).all():
+            raise ValueError("A feature is entirely missing in the training data.")
+        filled = np.where(np.isnan(X), self.median_, X)
+        self.mean_ = np.mean(filled, axis=0)
+        self.scale_ = np.std(filled, axis=0)
+        self.scale_[self.scale_ < 1e-12] = 1.0
+        self.n_features_in_ = X.shape[1]
+        return self
 
-def manual_train_test_split(X, y, test_size=0.2, random_state=42):
-    np.random.seed(random_state)
-    indices = np.random.permutation(len(X))
-    test_len = int(len(X) * test_size)
-    test_idx, train_idx = indices[:test_len], indices[test_len:]
+    def transform(self, X):
+        if not hasattr(self, "median_"):
+            raise RuntimeError("Scaler has not been fitted.")
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError("Feature count does not match fitted scaler.")
+        if np.isinf(X).any():
+            raise ValueError("Infinite feature values are not supported.")
+        X = np.where(np.isnan(X), self.median_, X)
+        return (X - self.mean_) / self.scale_
+
+    def fit_transform(self, X):
+        return self.fit(X).transform(X)
+
+
+def _stratified_indices(y, test_size, rng):
+    y = np.asarray(y)
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be between 0 and 1.")
+    train_parts, test_parts = [], []
+    for cls in np.unique(y):
+        idx = np.flatnonzero(y == cls)
+        rng.shuffle(idx)
+        if len(idx) < 2:
+            raise ValueError("Each class needs at least two rows for stratified splitting.")
+        n_test = min(len(idx) - 1, max(1, int(round(len(idx) * test_size))))
+        test_parts.append(idx[:n_test])
+        train_parts.append(idx[n_test:])
+    train_idx = np.concatenate(train_parts)
+    test_idx = np.concatenate(test_parts)
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+    return train_idx, test_idx
+
+
+def manual_train_test_split(X, y, test_size=0.2, random_state=42, strategy="stratified"):
+    X, y = _validate_xy(X, y)
+    rng = np.random.default_rng(random_state)
+    if strategy == "stratified":
+        train_idx, test_idx = _stratified_indices(y, test_size, rng)
+    elif strategy == "random":
+        idx = rng.permutation(len(y))
+        n_test = max(1, min(len(y) - 1, int(round(len(y) * test_size))))
+        test_idx, train_idx = idx[:n_test], idx[n_test:]
+    else:
+        raise ValueError("strategy must be 'stratified' or 'random'.")
     return X[train_idx], X[test_idx], y[train_idx], y[test_idx]
 
+
 def manual_metrics(y_true, y_pred_proba, threshold=0.5):
-    y_pred = (y_pred_proba >= threshold).astype(int)
-    tp = np.sum((y_true == 1) & (y_pred == 1))
-    fp = np.sum((y_true == 0) & (y_pred == 1))
-    tn = np.sum((y_true == 0) & (y_pred == 0))
-    fn = np.sum((y_true == 1) & (y_pred == 0))
-    
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
-    
-    # ROC-AUC Calculation (Manual)
-    desc_score_indices = np.argsort(y_pred_proba)[::-1]
-    y_true_sorted = y_true[desc_score_indices]
-    tps = np.cumsum(y_true_sorted)
-    fps = np.cumsum(1 - y_true_sorted)
-    
-    tpr = tps / (tps[-1] + 1e-8)
-    fpr = fps / (fps[-1] + 1e-8)
-    auc = np.sum((fpr[1:] - fpr[:-1]) * (tpr[1:] + tpr[:-1])) / 2.0
-    
-    # PR-AUC Calculation (Manual)
-    precision_curve = tps / (tps + fps + 1e-8)
-    recall_curve = tps / (tps[-1] + 1e-8)
-    pr_auc = np.sum((recall_curve[1:] - recall_curve[:-1]) * (precision_curve[1:] + precision_curve[:-1])) / 2.0
-    
-    return {
-        "precision": precision, 
-        "recall": recall, 
-        "f1": f1, 
-        "roc_auc": abs(auc), 
-        "pr_auc": abs(pr_auc)
-    }
-# ==========================================
-# 2. MANUAL MODELS
-# ==========================================
+    from .evaluate import compute_metrics
+    return compute_metrics(y_true, y_pred_proba, threshold)
+
 
 class ManualLogisticRegression:
-    def __init__(self, learning_rate=0.01, epochs=100):
-        self.lr = learning_rate
-        self.epochs = epochs
-        self.weights = None
-        self.bias = None
+    def __init__(self, learning_rate=0.05, epochs=300, l2=1e-4,
+                 scale_pos_weight=None):
+        if scale_pos_weight is not None and (
+            not np.isfinite(scale_pos_weight) or scale_pos_weight <= 0
+        ):
+            raise ValueError("scale_pos_weight must be positive and finite.")
+        self.lr, self.epochs, self.l2 = learning_rate, epochs, l2
+        self.scale_pos_weight = scale_pos_weight
 
     def fit(self, X, y):
-        n_samples, n_features = X.shape
-        self.weights = np.zeros(n_features)
-        self.bias = 0.0
-        
-        # Class imbalance handle karne ke liye weights
-        pos_weight = (n_samples - np.sum(y)) / (np.sum(y) + 1e-8)
-        sample_weights = np.where(y == 1, pos_weight, 1.0)
-
+        X, y = _validate_xy(X, y)
+        if not set(np.unique(y)).issubset({0.0, 1.0}) or len(np.unique(y)) != 2:
+            raise ValueError("Logistic regression requires both binary classes.")
+        n, p = X.shape
+        self.weights = np.zeros(p)
+        prior = np.clip(np.mean(y), 1e-6, 1 - 1e-6)
+        self.bias = float(np.log(prior / (1 - prior)))
+        pos_weight = (
+            self.scale_pos_weight
+            if self.scale_pos_weight is not None
+            else (n - y.sum()) / max(y.sum(), 1.0)
+        )
+        sw = np.where(y == 1, pos_weight, 1.0)
+        sw = sw / np.mean(sw)
         for _ in range(self.epochs):
-            linear_model = np.dot(X, self.weights) + self.bias
-            y_pred = 1 / (1 + np.exp(-np.clip(linear_model, -250, 250)))
-            
-            dw = (1 / n_samples) * np.dot(X.T, (y_pred - y) * sample_weights)
-            db = (1 / n_samples) * np.sum((y_pred - y) * sample_weights)
-            
-            self.weights -= self.lr * dw
-            self.bias -= self.lr * db
+            prob = _sigmoid(X @ self.weights + self.bias)
+            error = (prob - y) * sw
+            self.weights -= self.lr * ((X.T @ error) / n + self.l2 * self.weights)
+            self.bias -= self.lr * np.mean(error)
         return self
 
     def predict_proba(self, X):
-        linear_model = np.dot(X, self.weights) + self.bias
-        prob = 1 / (1 + np.exp(-np.clip(linear_model, -250, 250)))
-        return np.vstack([1 - prob, prob]).T # 2D array return karta hai
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or X.shape[1] != len(self.weights):
+            raise ValueError("Feature count does not match fitted logistic regression.")
+        p = _sigmoid(X @ self.weights + self.bias)
+        return np.column_stack((1 - p, p))
+
 
 class ManualDecisionTree:
-    def __init__(self, max_depth=3, min_samples_split=2):
+    """Binary Gini classification tree or squared-error regression tree."""
+    def __init__(self, max_depth=3, min_samples_split=4, max_features=None,
+                 criterion="gini", random_state=42, max_thresholds=16):
+        if criterion not in ("gini", "mse"):
+            raise ValueError("criterion must be 'gini' or 'mse'.")
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
-        self.tree = None
+        self.max_features = max_features
+        self.criterion = criterion
+        self.random_state = random_state
+        self.max_thresholds = max_thresholds
 
-    def _gini(self, y):
-        classes = np.unique(y)
-        gini = 1.0
-        for cls in classes:
-            p = np.sum(y == cls) / len(y)
-            gini -= p**2
-        return gini
+    def _impurity(self, y):
+        if self.criterion == "mse":
+            return float(np.var(y))
+        p = float(np.mean(y))
+        return 2.0 * p * (1.0 - p)
 
-    def _split(self, X, y):
-        # Continuous targets (residuals) ke liye Variance (MSE) use karega
-        best_var, best_idx, best_thresh = float('inf'), None, None
-        
-        # Sirf 10 random features check karo (Speed badhane ke liye)
-        features = np.random.choice(X.shape[1], min(10, X.shape[1]), replace=False)
-        
-        for idx in features:
-            thresh = np.median(X[:, idx]) 
-            left_mask = X[:, idx] <= thresh
-            right_mask = ~left_mask
-            
-            if len(y[left_mask]) == 0 or len(y[right_mask]) == 0: 
+    def _best_split(self, X, y, rng):
+        n, p = X.shape
+        count = p if self.max_features is None else min(p, self.max_features)
+        features = rng.choice(p, count, replace=False)
+        parent = self._impurity(y)
+        best_gain, best = 0.0, None
+
+        for j in features:
+            values = np.unique(X[:, j])
+            if len(values) < 2:
                 continue
-            
-            # Variance / MSE Calculation
-            left_var = np.var(y[left_mask]) if len(y[left_mask]) > 0 else 0
-            right_var = np.var(y[right_mask]) if len(y[right_mask]) > 0 else 0
-            var = (len(y[left_mask])/len(y)) * left_var + (len(y[right_mask])/len(y)) * right_var
-            
-            if var < best_var:
-                best_var, best_idx, best_thresh = var, idx, thresh
-                
-        return best_idx, best_thresh
-        # Continuous targets (residuals) ke liye Variance use karega
-        best_var, best_idx, best_thresh = float('inf'), None, None
-        
-        features = np.random.choice(X.shape[1], min(10, X.shape[1]), replace=False)
-        
-        for idx in features:
-            thresh = np.median(X[:, idx]) 
-            left_mask = X[:, idx] <= thresh
-            right_mask = ~left_mask
-            
-            if len(y[left_mask]) == 0 or len(y[right_mask]) == 0: 
-                continue
-            
-            # Variance / MSE Calculation
-            left_var = np.var(y[left_mask]) if len(y[left_mask]) > 0 else 0
-            right_var = np.var(y[right_mask]) if len(y[right_mask]) > 0 else 0
-            var = (len(y[left_mask])/len(y)) * left_var + (len(y[right_mask])/len(y)) * right_var
-            
-            if var < best_var:
-                best_var, best_idx, best_thresh = var, idx, thresh
-                
-        return best_idx, best_thresh
-    def _build_tree(self, X, y, depth=0):
-        if depth >= self.max_depth or len(np.unique(y)) == 1 or len(y) < self.min_samples_split:
-            return np.mean(y)
-        
-        idx, thresh = self._split(X, y)
-        if idx is None: return np.mean(y)
-        
-        left_mask = X[:, idx] <= thresh
-        right_mask = ~left_mask
-        
+            if len(values) > self.max_thresholds + 1:
+                qs = np.linspace(0, 1, self.max_thresholds + 2)[1:-1]
+                thresholds = np.unique(np.quantile(values, qs))
+            else:
+                thresholds = (values[:-1] + values[1:]) / 2.0
+
+            for threshold in thresholds:
+                left = X[:, j] <= threshold
+                nl = int(left.sum())
+                nr = n - nl
+                if nl < 1 or nr < 1:
+                    continue
+                child = (nl / n) * self._impurity(y[left]) + (nr / n) * self._impurity(y[~left])
+                gain = parent - child
+                if gain > best_gain + 1e-12:
+                    best_gain, best = gain, (int(j), float(threshold))
+        return best
+
+    def _build(self, X, y, depth, rng):
+        if self.criterion == "gini":
+            value = float(np.mean(y))
+            pure = value <= 0 or value >= 1
+        else:
+            value = float(np.mean(y))
+            pure = float(np.var(y)) <= 1e-14
+        if depth >= self.max_depth or len(y) < self.min_samples_split or pure:
+            return value
+        split = self._best_split(X, y, rng)
+        if split is None:
+            return value
+        j, threshold = split
+        left = X[:, j] <= threshold
         return {
-            'idx': idx, 'thresh': thresh,
-            'left': self._build_tree(X[left_mask], y[left_mask], depth + 1),
-            'right': self._build_tree(X[right_mask], y[right_mask], depth + 1)
+            "feature": j, "threshold": threshold,
+            "left": self._build(X[left], y[left], depth + 1, rng),
+            "right": self._build(X[~left], y[~left], depth + 1, rng),
         }
 
     def fit(self, X, y):
-        self.tree = self._build_tree(X, y)
+        X, y = _validate_xy(X, y)
+        if self.criterion == "gini" and not set(np.unique(y)).issubset({0.0, 1.0}):
+            raise ValueError("Gini classification tree requires binary labels.")
+        self.n_features_in_ = X.shape[1]
+        self.tree_ = self._build(X, y, 0, np.random.default_rng(self.random_state))
         return self
 
-    def _predict_single(self, x, tree):
-        if not isinstance(tree, dict): return tree
-        if x[tree['idx']] <= tree['thresh']: return self._predict_single(x, tree['left'])
-        return self._predict_single(x, tree['right'])
+    def _predict_one(self, row, node):
+        while isinstance(node, dict):
+            node = node["left"] if row[node["feature"]] <= node["threshold"] else node["right"]
+        return float(node)
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError("Feature count does not match fitted tree.")
+        return np.array([self._predict_one(row, self.tree_) for row in X])
 
     def predict_proba(self, X):
-        prob = np.array([self._predict_single(x, self.tree) for x in X])
-        prob = np.clip(prob, 0.001, 0.999)
-        return np.vstack([1 - prob, prob]).T
+        if self.criterion != "gini":
+            raise RuntimeError("Regression tree does not provide class probabilities.")
+        p = np.clip(self.predict(X), 0.0, 1.0)
+        return np.column_stack((1 - p, p))
+
 
 class ManualRandomForest:
-    def __init__(self, n_estimators=5, max_depth=3):
-        self.n_estimators = n_estimators
-        self.max_depth = max_depth
-        self.trees = []
+    def __init__(self, n_estimators=25, max_depth=5, random_state=42, max_features="sqrt"):
+        self.n_estimators, self.max_depth = n_estimators, max_depth
+        self.random_state, self.max_features = random_state, max_features
 
     def fit(self, X, y):
+        X, y = _validate_xy(X, y)
+        if not set(np.unique(y)).issubset({0.0, 1.0}):
+            raise ValueError("Random forest requires binary labels.")
+        rng = np.random.default_rng(self.random_state)
         self.trees = []
-        n_samples = len(X)
-        for _ in range(self.n_estimators):
-            idx = np.random.choice(n_samples, n_samples, replace=True)
-            tree = ManualDecisionTree(max_depth=self.max_depth)
+        p = X.shape[1]
+        mf = max(1, int(np.sqrt(p))) if self.max_features == "sqrt" else int(self.max_features)
+        for i in range(self.n_estimators):
+            idx = rng.integers(0, len(y), size=len(y))
+            tree = ManualDecisionTree(
+                max_depth=self.max_depth, min_samples_split=4,
+                max_features=mf, criterion="gini",
+                random_state=int(rng.integers(0, 2**31 - 1)),
+            )
             tree.fit(X[idx], y[idx])
             self.trees.append(tree)
+        self.n_features_in_ = p
         return self
 
     def predict_proba(self, X):
-        preds = np.array([tree.predict_proba(X) for tree in self.trees])
-        return np.mean(preds, axis=0)
+        if not self.trees:
+            raise RuntimeError("Random forest has not been fitted.")
+        return np.mean([tree.predict_proba(X) for tree in self.trees], axis=0)
+
 
 class ManualGradientBoosting:
-    def __init__(self, n_estimators=5, learning_rate=0.1, max_depth=2):
-        self.n_estimators = n_estimators
-        self.lr = learning_rate
-        self.max_depth = max_depth
-        self.trees = []
-        self.base_pred = None
+    """Gradient boosting for binary logistic loss using regression trees on pseudo-residuals."""
+    def __init__(self, n_estimators=25, learning_rate=0.05, max_depth=2, random_state=42):
+        self.n_estimators, self.lr = n_estimators, learning_rate
+        self.max_depth, self.random_state = max_depth, random_state
 
     def fit(self, X, y):
+        X, y = _validate_xy(X, y)
+        if not set(np.unique(y)).issubset({0.0, 1.0}) or len(np.unique(y)) != 2:
+            raise ValueError("Gradient boosting requires both binary classes.")
+        prior = np.clip(np.mean(y), 1e-6, 1 - 1e-6)
+        self.base_pred = float(np.log(prior / (1 - prior)))
+        raw = np.full(len(y), self.base_pred)
         self.trees = []
-        self.base_pred = np.log(np.mean(y) / (1 - np.mean(y) + 1e-8))
-        current_pred = np.full(len(y), self.base_pred)
-        
+        rng = np.random.default_rng(self.random_state)
+
         for _ in range(self.n_estimators):
-            p = 1 / (1 + np.exp(-np.clip(current_pred, -250, 250)))
-            residuals = y - p
-            
-            tree = ManualDecisionTree(max_depth=self.max_depth)
-            tree.fit(X, residuals)
+            prob = _sigmoid(raw)
+            residual = y - prob
+            tree = ManualDecisionTree(
+                max_depth=self.max_depth, min_samples_split=4,
+                criterion="mse", random_state=int(rng.integers(0, 2**31 - 1)),
+            )
+            tree.fit(X, residual)
+            update = tree.predict(X)
+            raw += self.lr * update
             self.trees.append(tree)
-            
-            update = tree.predict_proba(X)[:, 1]
-            current_pred += self.lr * update
+        self.n_features_in_ = X.shape[1]
         return self
 
     def predict_proba(self, X):
-        current_pred = np.full(len(X), self.base_pred)
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError("Feature count does not match fitted gradient booster.")
+        raw = np.full(len(X), self.base_pred)
         for tree in self.trees:
-            current_pred += self.lr * tree.predict_proba(X)[:, 1]
-        prob = 1 / (1 + np.exp(-np.clip(current_pred, -250, 250)))
-        return np.vstack([1 - prob, prob]).T
+            raw += self.lr * tree.predict(X)
+        p = _sigmoid(raw)
+        return np.column_stack((1 - p, p))
+
+
+
+
+class _ManualNewtonBooster:
+    """Shared second-order logistic boosting primitives; no external ML library."""
+
+    def __init__(
+        self, n_estimators=10, learning_rate=0.05, max_depth=3,
+        reg_lambda=1.0, gamma=0.0, min_child_weight=1.0,
+        min_samples_leaf=2, scale_pos_weight=1.0, random_state=42
+    ):
+        if n_estimators < 1 or learning_rate <= 0 or max_depth < 1:
+            raise ValueError("Invalid boosting configuration.")
+        if reg_lambda < 0 or gamma < 0 or min_child_weight < 0:
+            raise ValueError("Regularisation parameters cannot be negative.")
+        if min_samples_leaf < 1 or scale_pos_weight <= 0:
+            raise ValueError("Invalid leaf size or class weight.")
+        self.n_estimators = int(n_estimators)
+        self.lr = float(learning_rate)
+        self.max_depth = int(max_depth)
+        self.reg_lambda = float(reg_lambda)
+        self.gamma = float(gamma)
+        self.min_child_weight = float(min_child_weight)
+        self.min_samples_leaf = int(min_samples_leaf)
+        self.scale_pos_weight = float(scale_pos_weight)
+        self.random_state = int(random_state)
+
+    def _leaf_value(self, grad, hess, indices):
+        g = float(np.sum(grad[indices]))
+        h = float(np.sum(hess[indices]))
+        return -g / (h + self.reg_lambda)
+
+    def _gain(self, grad, hess, left, right):
+        gl, gr = float(grad[left].sum()), float(grad[right].sum())
+        hl, hr = float(hess[left].sum()), float(hess[right].sum())
+        if (
+            len(left) < self.min_samples_leaf
+            or len(right) < self.min_samples_leaf
+            or hl < self.min_child_weight
+            or hr < self.min_child_weight
+        ):
+            return None
+        gp, hp = gl + gr, hl + hr
+        gain = (
+            gl * gl / (hl + self.reg_lambda)
+            + gr * gr / (hr + self.reg_lambda)
+            - gp * gp / (hp + self.reg_lambda)
+            - self.gamma
+        )
+        return float(gain) if np.isfinite(gain) else None
+
+    @staticmethod
+    def _predict_tree_one(row, node):
+        while "value" not in node:
+            if row[node["feature"]] <= node["threshold"]:
+                node = node["left"]
+            else:
+                node = node["right"]
+        return node["value"]
+
+    def _tree_predict(self, X, tree):
+        return np.fromiter(
+            (self._predict_tree_one(row, tree) for row in X),
+            dtype=float, count=len(X)
+        )
+
+    def _initialise(self, X, y):
+        X, y = _validate_xy(X, y)
+        if not set(np.unique(y)).issubset({0.0, 1.0}) or len(np.unique(y)) != 2:
+            raise ValueError("Boosting requires both binary classes.")
+        self.n_features_in_ = X.shape[1]
+        weights = np.where(y == 1, self.scale_pos_weight, 1.0)
+        prior = np.sum(weights * y) / np.sum(weights)
+        prior = float(np.clip(prior, 1e-8, 1 - 1e-8))
+        self.base_pred_ = float(np.log(prior / (1 - prior)))
+        raw = np.full(len(y), self.base_pred_, dtype=float)
+        self.trees_ = []
+        return X, y, weights, raw
+
+    def _fit_boosting(self, X, y, tree_builder):
+        X, y, weights, raw = self._initialise(X, y)
+        for _ in range(self.n_estimators):
+            prob = _sigmoid(raw)
+            grad = (prob - y) * weights
+            hess = np.maximum(prob * (1.0 - prob) * weights, 1e-8)
+            tree = tree_builder(X, grad, hess)
+            raw += self.lr * self._tree_predict(X, tree)
+            self.trees_.append(tree)
+        return self
+
+    def predict_proba(self, X):
+        if not hasattr(self, "trees_"):
+            raise RuntimeError("Booster has not been fitted.")
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or X.shape[1] != self.n_features_in_:
+            raise ValueError("Feature count does not match fitted booster.")
+        if not np.isfinite(X).all():
+            raise ValueError("Prediction features must be finite.")
+        raw = np.full(len(X), self.base_pred_, dtype=float)
+        for tree in self.trees_:
+            raw += self.lr * self._tree_predict(X, tree)
+        p = _sigmoid(raw)
+        return np.column_stack((1.0 - p, p))
+
+
+class ManualXGBoost(_ManualNewtonBooster):
+    """
+    XGBoost-inspired manual binary booster.
+    Uses logistic gradients/Hessians, L2-regularised split gain,
+    gamma pruning and recursive depth-wise tree construction.
+    """
+
+    def __init__(self, n_estimators=10, learning_rate=0.05, max_depth=3,
+                 reg_lambda=1.0, gamma=0.0, min_child_weight=1.0,
+                 min_samples_leaf=2, scale_pos_weight=1.0,
+                 max_thresholds=16, random_state=42):
+        super().__init__(
+            n_estimators, learning_rate, max_depth, reg_lambda, gamma,
+            min_child_weight, min_samples_leaf, scale_pos_weight, random_state
+        )
+        if max_thresholds < 2:
+            raise ValueError("max_thresholds must be at least 2.")
+        self.max_thresholds = int(max_thresholds)
+
+    def _thresholds(self, values):
+        unique = np.unique(values)
+        if len(unique) < 2:
+            return np.empty(0)
+        if len(unique) > self.max_thresholds + 1:
+            qs = np.linspace(0, 1, self.max_thresholds + 2)[1:-1]
+            cuts = np.unique(np.quantile(unique, qs))
+        else:
+            cuts = (unique[:-1] + unique[1:]) / 2.0
+        return cuts
+
+    def _best_split(self, X, grad, hess, indices):
+        best_gain, best = self.gamma, None
+        for feature in range(X.shape[1]):
+            values = X[indices, feature]
+            for threshold in self._thresholds(values):
+                mask = values <= threshold
+                left, right = indices[mask], indices[~mask]
+                gain = self._gain(grad, hess, left, right)
+                if gain is not None and gain > best_gain + 1e-12:
+                    best_gain = gain
+                    best = (feature, float(threshold), left, right)
+        return best_gain, best
+
+    def _build_depthwise(self, X, grad, hess, indices, depth):
+        leaf = {"value": self._leaf_value(grad, hess, indices)}
+        if depth >= self.max_depth or len(indices) < 2 * self.min_samples_leaf:
+            return leaf
+        _, split = self._best_split(X, grad, hess, indices)
+        if split is None:
+            return leaf
+        feature, threshold, left, right = split
+        return {
+            "feature": feature, "threshold": threshold,
+            "left": self._build_depthwise(X, grad, hess, left, depth + 1),
+            "right": self._build_depthwise(X, grad, hess, right, depth + 1),
+        }
+
+    def fit(self, X, y):
+        def builder(features, grad, hess):
+            return self._build_depthwise(
+                features, grad, hess, np.arange(len(grad)), 0
+            )
+        return self._fit_boosting(X, y, builder)
+
+
+class ManualLightGBM(_ManualNewtonBooster):
+    """
+    LightGBM-inspired manual binary booster.
+    Uses quantile-derived histogram bin thresholds and grows the leaf
+    with the largest regularised second-order gain until max_leaves.
+    """
+
+    def __init__(self, n_estimators=10, learning_rate=0.05, max_depth=4,
+                 max_leaves=7, max_bins=16, reg_lambda=1.0, gamma=0.0,
+                 min_child_weight=1.0, min_samples_leaf=2,
+                 scale_pos_weight=1.0, random_state=42):
+        super().__init__(
+            n_estimators, learning_rate, max_depth, reg_lambda, gamma,
+            min_child_weight, min_samples_leaf, scale_pos_weight, random_state
+        )
+        if max_leaves < 2 or max_bins < 2:
+            raise ValueError("max_leaves and max_bins must be at least 2.")
+        self.max_leaves = int(max_leaves)
+        self.max_bins = int(max_bins)
+
+    def _build_leafwise(self, X, grad, hess):
+        # Histogram cut points are estimated once per tree, then reused
+        # by every leaf, rather than searching all raw unique values.
+        cuts = []
+        quantiles = np.linspace(0, 1, self.max_bins + 1)[1:-1]
+        for j in range(X.shape[1]):
+            values = np.unique(X[:, j])
+            if len(values) < 2:
+                cuts.append(np.empty(0))
+            else:
+                cuts.append(np.unique(np.quantile(values, quantiles)))
+
+        root_idx = np.arange(len(grad))
+        root = {
+            "indices": root_idx,
+            "depth": 0,
+            "value": self._leaf_value(grad, hess, root_idx),
+        }
+
+        def best_for_leaf(node):
+            idx = node["indices"]
+            if node["depth"] >= self.max_depth or len(idx) < 2 * self.min_samples_leaf:
+                return None
+            best_gain, best = self.gamma, None
+            for feature, thresholds in enumerate(cuts):
+                vals = X[idx, feature]
+                for threshold in thresholds:
+                    mask = vals <= threshold
+                    left, right = idx[mask], idx[~mask]
+                    gain = self._gain(grad, hess, left, right)
+                    if gain is not None and gain > best_gain + 1e-12:
+                        best_gain = gain
+                        best = (feature, float(threshold), left, right)
+            if best is None:
+                return None
+            return best_gain, best
+
+        leaves = [root]
+        candidates = {id(root): best_for_leaf(root)}
+
+        while len(leaves) < self.max_leaves:
+            eligible = [
+                (candidate[0], node, candidate[1])
+                for node in leaves
+                if (candidate := candidates.get(id(node))) is not None
+            ]
+            if not eligible:
+                break
+            _, node, split = max(eligible, key=lambda item: item[0])
+            feature, threshold, left_idx, right_idx = split
+            left = {
+                "indices": left_idx, "depth": node["depth"] + 1,
+                "value": self._leaf_value(grad, hess, left_idx),
+            }
+            right = {
+                "indices": right_idx, "depth": node["depth"] + 1,
+                "value": self._leaf_value(grad, hess, right_idx),
+            }
+            node.clear()
+            node.update({
+                "feature": feature, "threshold": threshold,
+                "left": left, "right": right,
+            })
+            leaves.remove(node)
+            candidates.pop(id(node), None)
+            leaves.extend((left, right))
+            candidates[id(left)] = best_for_leaf(left)
+            candidates[id(right)] = best_for_leaf(right)
+
+        # Remove training row indices from terminal nodes before persistence.
+        for leaf in leaves:
+            leaf.pop("indices", None)
+            leaf.pop("depth", None)
+        return root
+
+    def fit(self, X, y):
+        return self._fit_boosting(X, y, self._build_leafwise)
+
 
 class ManualStackingClassifier:
-    def __init__(self, base_models, meta_model, cv=3):
-        self.base_models = base_models
-        self.meta_model = meta_model
-        self.cv = cv
+    def __init__(self, base_models, meta_model, cv=3, random_state=42):
+        self.base_models, self.meta_model = base_models, meta_model
+        self.cv, self.random_state = cv, random_state
 
     def fit(self, X, y):
-        indices = np.arange(len(X))
-        np.random.shuffle(indices)
-        folds = np.array_split(indices, self.cv)
-        
-        meta_features = np.zeros((len(X), len(self.base_models)))
-        
-        for i in range(self.cv):
-            val_idx = folds[i]
-            train_idx = np.concatenate([folds[j] for j in range(self.cv) if j != i])
-            
-            X_train, y_train = X[train_idx], y[train_idx]
-            X_val = X[val_idx]
-            
-            for j, model in enumerate(self.base_models):
-                m = copy.deepcopy(model)
-                m.fit(X_train, y_train)
-                meta_features[val_idx, j] = m.predict_proba(X_val)[:, 1]
+        X, y = _validate_xy(X, y)
+        if self.cv < 2:
+            raise ValueError("Stacking requires at least two folds.")
+        rng = np.random.default_rng(self.random_state)
+        class_folds = [[] for _ in range(self.cv)]
+        for cls in np.unique(y):
+            idx = np.flatnonzero(y == cls)
+            if len(idx) < self.cv:
+                raise ValueError("Each class must have at least cv rows for stratified stacking.")
+            rng.shuffle(idx)
+            for k, part in enumerate(np.array_split(idx, self.cv)):
+                class_folds[k].extend(part.tolist())
+        folds = [np.asarray(f, dtype=int) for f in class_folds]
+        meta = np.zeros((len(y), len(self.base_models)), dtype=float)
 
-        self.meta_model.fit(meta_features, y)
-        
+        for k, val_idx in enumerate(folds):
+            train_idx = np.concatenate([folds[j] for j in range(self.cv) if j != k])
+            for j, model in enumerate(self.base_models):
+                fitted = copy.deepcopy(model)
+                fitted.fit(X[train_idx], y[train_idx])
+                meta[val_idx, j] = fitted.predict_proba(X[val_idx])[:, 1]
+
+        self.meta_model.fit(meta, y)
+        self.fitted_base_models_ = []
         for model in self.base_models:
-            model.fit(X, y)
+            fitted = copy.deepcopy(model)
+            fitted.fit(X, y)
+            self.fitted_base_models_.append(fitted)
+        self.n_features_in_ = X.shape[1]
         return self
 
     def predict_proba(self, X):
-        meta_features = np.zeros((len(X), len(self.base_models)))
-        for j, model in enumerate(self.base_models):
-            meta_features[:, j] = model.predict_proba(X)[:, 1]
-        return self.meta_model.predict_proba(meta_features)
+        X = np.asarray(X, dtype=float)
+        meta = np.column_stack([m.predict_proba(X)[:, 1] for m in self.fitted_base_models_])
+        return self.meta_model.predict_proba(meta)
 
-# ==========================================
-# 3. MANUAL SHAP (Permutation Importance)
-# ==========================================
-def manual_feature_importance(model, X, y):
-    base_pred = model.predict_proba(X)[:, 1]
-    base_score = manual_metrics(y, base_pred)['roc_auc']
-    importances = []
-    
-    for col in range(X.shape[1]):
-        X_permuted = X.copy()
-        np.random.shuffle(X_permuted[:, col])
-        perm_pred = model.predict_proba(X_permuted)[:, 1]
-        perm_score = manual_metrics(y, perm_pred)['roc_auc']
-        importances.append(base_score - perm_score)
-        
-    return np.array(importances)
+
+def manual_feature_importance(model, X, y, random_state=42):
+    """Permutation importance; this is not SHAP."""
+    X, y = _validate_xy(X, y)
+    from .evaluate import compute_metrics
+    base = compute_metrics(y, model.predict_proba(X)[:, 1])["roc_auc"]
+    rng = np.random.default_rng(random_state)
+    result = []
+    for j in range(X.shape[1]):
+        permuted = X.copy()
+        permuted[:, j] = rng.permutation(permuted[:, j])
+        score = compute_metrics(y, model.predict_proba(permuted)[:, 1])["roc_auc"]
+        result.append(base - score if np.isfinite(base) and np.isfinite(score) else 0.0)
+    return np.asarray(result)

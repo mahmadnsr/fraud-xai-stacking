@@ -1,4 +1,5 @@
-"""Streamlit entry point:  streamlit run app.py"""
+"""Root entry point for the Financial Fraud Detection dashboard."""
 from fraud_xai.ui import run
 
-run()
+if __name__ == "__main__":
+    run()

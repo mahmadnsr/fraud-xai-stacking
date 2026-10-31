@@ -58,24 +58,58 @@ _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1}
 
 
 def hash_password(password: str) -> str:
-    if not password or len(password) < 10:
+    if not isinstance(password, str) or len(password) < 10:
         raise ValueError("Password must be at least 10 characters.")
+
     salt = os.urandom(16)
-    dk = hashlib.scrypt(password.encode(), salt=salt, dklen=32, **_SCRYPT)
-    return "scrypt${n}${r}${p}${}${}".format(base64.b64encode(salt).decode(), base64.b64encode(dk).decode(), **_SCRYPT)
+    dk = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        dklen=32,
+        **_SCRYPT,
+    )
+
+    salt_b64 = base64.b64encode(salt).decode("ascii")
+    dk_b64 = base64.b64encode(dk).decode("ascii")
+
+    return f"scrypt${_SCRYPT['n']}${_SCRYPT['r']}${_SCRYPT['p']}${salt_b64}${dk_b64}"
 
 
 def verify_password(password: str, stored: str) -> bool:
     try:
-        _, n, r, p, salt_b64, dk_b64 = stored.split("$")
-        salt, expected = base64.b64decode(salt_b64), base64.b64decode(dk_b64)
-        dk = hashlib.scrypt(password.encode(), salt=salt, dklen=len(expected), n=int(n), r=int(r), p=int(p))
-    except (ValueError, TypeError):
+        if not isinstance(password, str) or not isinstance(stored, str):
+            return False
+
+        algorithm, n, r, p, salt_b64, dk_b64 = stored.split("$")
+
+        if algorithm != "scrypt":
+            return False
+
+        n, r, p = int(n), int(r), int(p)
+
+        if n != _SCRYPT["n"] or r != _SCRYPT["r"] or p != _SCRYPT["p"]:
+            return False
+
+        salt = base64.b64decode(salt_b64, validate=True)
+        expected = base64.b64decode(dk_b64, validate=True)
+
+        if len(salt) != 16 or len(expected) != 32:
+            return False
+
+        actual = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            dklen=len(expected),
+            n=n,
+            r=r,
+            p=p,
+        )
+        return hmac.compare_digest(actual, expected)
+
+    except (ValueError, TypeError, UnicodeError):
         return False
-    return hmac.compare_digest(dk, expected)
 
 
-# ---- integrity ----
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with Path(path).open("rb") as fh:

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.datasets import make_classification
 
 from .config import DEFAULT_TARGET
 from .schema import DatasetReport, parse_csv_bytes, resolve_local_csv, validate_training_frame
@@ -39,16 +38,51 @@ class DatasetBundle:
 
 
 def make_synthetic(n_rows: int = 10_000, fraud_rate: float = 0.03, seed: int = 42) -> pd.DataFrame:
-    """Synthetic imbalanced data with the Credit-Card-Fraud column layout (Time, V1..V28, Amount, Class).
+    """Generate deterministic, clearly labelled synthetic binary fraud data.
 
-    This is NOT real transaction data and results on it say nothing about real-world performance.
+    This is artificial data for pipeline testing, not a representation of
+    real credit-card transactions or real-world fraud behaviour.
     """
-    X, y = make_classification(n_samples=n_rows, n_features=28, n_informative=10, n_redundant=4, n_clusters_per_class=2,
-                               weights=[1 - fraud_rate, fraud_rate], class_sep=1.2, flip_y=0.005, random_state=seed)
+    if not isinstance(n_rows, int) or n_rows < 20:
+        raise ValueError("n_rows must be an integer >= 20.")
+    if not 0.0 < fraud_rate < 1.0:
+        raise ValueError("fraud_rate must be strictly between 0 and 1.")
+
     rng = np.random.default_rng(seed)
+
+    n_fraud = int(round(n_rows * fraud_rate))
+    n_fraud = max(10, n_fraud)
+    n_fraud = min(n_rows - 10, n_fraud)
+
+    y = np.zeros(n_rows, dtype=np.int64)
+    y[:n_fraud] = 1
+    rng.shuffle(y)
+
+    # Ten informative latent features with class-dependent distributions.
+    latent = rng.normal(0.0, 1.0, size=(n_rows, 10))
+    latent[:, 0] += y * 1.8
+    latent[:, 1] -= y * 1.4
+    latent[:, 2] += y * 1.1
+    latent[:, 3] += y * 0.8
+
+    # Fourteen additional noisy/redundant features.
+    noise = rng.normal(0.0, 1.0, size=(n_rows, 14))
+    redundant = np.column_stack([
+        latent[:, 0] * 0.7 + rng.normal(0, 0.35, n_rows),
+        latent[:, 1] * 0.6 + rng.normal(0, 0.4, n_rows),
+        latent[:, 2] * 0.5 + rng.normal(0, 0.5, n_rows),
+        latent[:, 3] * 0.5 + rng.normal(0, 0.5, n_rows),
+    ])
+
+    X = np.column_stack([latent, noise, redundant])
+    X = X[:, :28]
+
     df = pd.DataFrame(X, columns=[f"V{i}" for i in range(1, 29)])
     df.insert(0, "Time", np.sort(rng.uniform(0, 172_800, n_rows)).round(0))
-    df["Amount"] = np.round(rng.lognormal(3.5, 1.2, n_rows) * (1 + 1.5 * y * rng.random(n_rows)), 2)
+    df["Amount"] = np.round(
+        rng.lognormal(3.5, 1.2, n_rows) * (1.0 + 1.5 * y * rng.random(n_rows)),
+        2,
+    )
     df[DEFAULT_TARGET] = y
     return df
 

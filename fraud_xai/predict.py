@@ -22,7 +22,11 @@ def predict_frame(model: LoadedModel, model_name: str, X: pd.DataFrame, threshol
     if not 0.0 < threshold < 1.0:
         raise ValidationError("Threshold must be strictly between 0 and 1.")
     X = validate_feature_frame(X, model.feature_names, max_rows)
-    p = model.models[model_name].predict_proba(X)[:, 1]
+    try:
+        X_scaled = model.preprocessor.transform(X.to_numpy(dtype=float))
+        p = model.models[model_name].predict_proba(X_scaled)[:, 1]
+    except (ValueError, TypeError, AttributeError, FloatingPointError):
+        raise ValidationError("Input data could not be preprocessed.") from None
     if p.shape != (len(X),) or not np.isfinite(p).all() or p.min() < 0 or p.max() > 1:
         raise RuntimeError("Model returned invalid probabilities.")
     return pd.DataFrame({"fraud_probability": p, "predicted_class": (p >= threshold).astype(int),
