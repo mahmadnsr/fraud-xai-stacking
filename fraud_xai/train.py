@@ -37,9 +37,27 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
     say = progress or (lambda m: None)
     X, y = prepare_xy(bundle.frame, bundle.target)
     imb = imbalance_summary(y)
-    say(f"Prepared {len(X):,} unique records ({imb['fraud']:,} fraud, imbalance ratio {imb['imbalance_ratio']:.1f}:1)")
+    say(f"Prepared {len(X):,} records ({imb['fraud']:,} fraud, imbalance ratio {imb['imbalance_ratio']:.1f}:1)")
 
-    s: Splits = split_data(X, y, cfg.split_strategy, cfg.val_size, cfg.test_size, cfg.seed)
+
+
+    time_values = None
+    if cfg.split_strategy == "chronological":
+        if "Time" not in bundle.frame.columns:
+            raise ValueError(
+                "Chronological splitting requires a 'Time' column in the dataset."
+            )
+        time_values = bundle.frame["Time"].to_numpy()
+
+    s: Splits = split_data(
+        X,
+        y,
+        cfg.split_strategy,
+        cfg.val_size,
+        cfg.test_size,
+        cfg.seed,
+        time_values=time_values,
+    )
     say(f"Split ({s.strategy}): {s.sizes()} fraud per split: {s.fraud_counts()}")
     spw = float((s.y_train == 0).sum() / max((s.y_train == 1).sum(), 1))
 
@@ -58,10 +76,17 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
         fit_seconds[name] = time.perf_counter() - t
 
     # 2. Train Standard Stacking (Baseline)
-    say(f"Training standard stacking ensemble ({cfg.cv_folds}-fold out-of-fold meta-features, Logistic Regression meta-learner) ...")
+    stack_method_label = (f"{cfg.cv_folds} timestamp-group-aware expanding-window chronological OOF blocks" if cfg.split_strategy == "chronological" else f"{cfg.cv_folds}-fold stratified OOF")
+    say(f"Training standard stacking ensemble ({stack_method_label}, Logistic Regression meta-learner) ...")
     t = time.perf_counter()
     try:
-        models[STACKING_NAME] = build_stacking(cfg, spw).fit(s.X_train, s.y_train)
+        stack_model = build_stacking(cfg, spw)
+        if cfg.split_strategy == "chronological":
+            models[STACKING_NAME] = stack_model.fit(
+                s.X_train, s.y_train, time_values=s.train_time_values
+            )
+        else:
+            models[STACKING_NAME] = stack_model.fit(s.X_train, s.y_train)
     except Exception as exc:
         log.exception("stacking training failed")
         raise RuntimeError(f"Training failed for the stacking ensemble ({type(exc).__name__}).") from exc
@@ -105,7 +130,7 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
         "feature_stats": {c: {"min": float(desc.loc[c, "min"]), "p01": float(desc.loc[c, "1%"]), "median": float(desc.loc[c, "50%"]),
                               "p99": float(desc.loc[c, "99%"]), "max": float(desc.loc[c, "max"])} for c in feature_names},
         "preprocessing": {"imputer": "median", "scaler": "ManualScaler (fit on training data)",
-                          "dedup": "exact duplicates removed before splitting",
+                          "dedup": "no deduplication; exact duplicate rows preserved and reported",
                           "imbalance": (
                               "positive-class weighting for Logistic Regression and "
                               "second-order boosters; Random Forest uses bootstrap "
@@ -116,8 +141,9 @@ def train_all(bundle: DatasetBundle, cfg: TrainConfig, settings: Settings, progr
         "stacking": {
             "base": BASE_MODEL_NAMES,
             "standard_meta_learner": "ManualLogisticRegression",
+            "meta_scale_pos_weight": cfg.meta_scale_pos_weight,
             "stack_method": "predict_proba",
-            "cv": f"Manual stratified {cfg.cv_folds}-fold out-of-fold split (seed={cfg.seed})",
+            "cv": (f"Timestamp-group-aware expanding-window chronological OOF: warm-up block plus {cfg.cv_folds} sequential validation blocks; equal timestamps kept together at fold boundaries" if cfg.split_strategy == "chronological" else f"Manual stratified {cfg.cv_folds}-fold OOF split (seed={cfg.seed})"),
             "passthrough": False
         },
         "thresholds": thresholds, "threshold_selection": "max F1 on validation set",

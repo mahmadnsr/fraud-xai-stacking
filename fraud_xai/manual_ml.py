@@ -572,39 +572,158 @@ class ManualLightGBM(_ManualNewtonBooster):
 
 
 class ManualStackingClassifier:
-    def __init__(self, base_models, meta_model, cv=3, random_state=42):
+    def __init__(
+        self, base_models, meta_model, cv=3, random_state=42,
+        split_strategy="stratified"
+    ):
         self.base_models, self.meta_model = base_models, meta_model
         self.cv, self.random_state = cv, random_state
+        self.split_strategy = split_strategy
 
-    def fit(self, X, y):
+    @staticmethod
+    def _set_fold_class_weight(model, y_train):
+        """Calculate class weight using only this OOF fold's training labels."""
+        if hasattr(model, "scale_pos_weight"):
+            positives = int(np.sum(y_train == 1))
+            negatives = int(np.sum(y_train == 0))
+            if positives == 0 or negatives == 0:
+                raise ValueError("Each OOF training fold must contain both classes.")
+            model.scale_pos_weight = float(negatives / positives)
+        return model
+
+    def fit(self, X, y, time_values=None):
         X, y = _validate_xy(X, y)
         if self.cv < 2:
             raise ValueError("Stacking requires at least two folds.")
-        rng = np.random.default_rng(self.random_state)
-        class_folds = [[] for _ in range(self.cv)]
-        for cls in np.unique(y):
-            idx = np.flatnonzero(y == cls)
-            if len(idx) < self.cv:
-                raise ValueError("Each class must have at least cv rows for stratified stacking.")
-            rng.shuffle(idx)
-            for k, part in enumerate(np.array_split(idx, self.cv)):
-                class_folds[k].extend(part.tolist())
-        folds = [np.asarray(f, dtype=int) for f in class_folds]
-        meta = np.zeros((len(y), len(self.base_models)), dtype=float)
 
-        for k, val_idx in enumerate(folds):
-            train_idx = np.concatenate([folds[j] for j in range(self.cv) if j != k])
-            for j, model in enumerate(self.base_models):
-                fitted = copy.deepcopy(model)
-                fitted.fit(X[train_idx], y[train_idx])
-                meta[val_idx, j] = fitted.predict_proba(X[val_idx])[:, 1]
+        if self.split_strategy == "chronological":
+            if time_values is None:
+                raise ValueError(
+                    "time_values are required for timestamp-safe chronological stacking."
+                )
 
-        self.meta_model.fit(meta, y)
+            time_values = np.asarray(time_values)
+            if time_values.ndim != 1 or len(time_values) != len(y):
+                raise ValueError("time_values must be one-dimensional and match y.")
+
+            try:
+                time_values = time_values.astype(float)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Chronological timestamps must be numeric.") from exc
+
+            if not np.all(np.isfinite(time_values)):
+                raise ValueError("time_values cannot contain missing or non-finite values.")
+
+            if np.any(time_values[1:] < time_values[:-1]):
+                raise ValueError("Chronological stacking requires ascending timestamps.")
+
+            # Group equal timestamps before dividing into OOF blocks.
+            group_starts = np.flatnonzero(
+                np.r_[True, time_values[1:] != time_values[:-1]]
+            )
+            group_ends = np.r_[group_starts[1:], len(y)]
+
+            if len(group_starts) < self.cv + 1:
+                raise ValueError(
+                    "Not enough distinct timestamp groups for chronological "
+                    "stacking; reduce cv_folds or provide more training data."
+                )
+
+            group_chunks = np.array_split(
+                np.arange(len(group_starts)), self.cv + 1
+            )
+            blocks = [
+                np.arange(group_starts[g[0]], group_ends[g[-1]])
+                for g in group_chunks
+            ]
+
+            if len(blocks[0]) == 0 or len(np.unique(y[blocks[0]])) < 2:
+                raise ValueError(
+                    "Chronological stacking warm-up block must contain "
+                    "both classes. Increase training data or reduce cv_folds."
+                )
+
+            meta_parts, target_parts = [], []
+
+            for k in range(1, len(blocks)):
+                val_idx = blocks[k]
+                if len(val_idx) == 0:
+                    continue
+
+                train_idx = np.arange(val_idx[0])
+                if len(np.unique(y[train_idx])) < 2:
+                    raise ValueError(
+                        f"Chronological stacking fold {k} has fewer than "
+                        "two classes in its historical training window."
+                    )
+
+                fold_meta = np.zeros(
+                    (len(val_idx), len(self.base_models)), dtype=float
+                )
+                for j, model in enumerate(self.base_models):
+                    fitted = copy.deepcopy(model)
+                    self._set_fold_class_weight(fitted, y[train_idx])
+                    fitted.fit(X[train_idx], y[train_idx])
+                    fold_meta[:, j] = fitted.predict_proba(X[val_idx])[:, 1]
+
+                meta_parts.append(fold_meta)
+                target_parts.append(y[val_idx])
+
+            if not meta_parts:
+                raise ValueError("No chronological OOF predictions were generated.")
+
+            meta = np.vstack(meta_parts)
+            meta_y = np.concatenate(target_parts)
+
+            if len(np.unique(meta_y)) < 2:
+                raise ValueError(
+                    "Chronological OOF meta-data must contain both classes. "
+                    "Adjust cv_folds or the chronological training window."
+                )
+
+            self.meta_model.fit(meta, meta_y)
+
+        elif self.split_strategy == "stratified":
+            rng = np.random.default_rng(self.random_state)
+            class_folds = [[] for _ in range(self.cv)]
+
+            for cls in np.unique(y):
+                idx = np.flatnonzero(y == cls)
+                if len(idx) < self.cv:
+                    raise ValueError(
+                        "Each class must have at least cv rows for stratified stacking."
+                    )
+                rng.shuffle(idx)
+                for k, part in enumerate(np.array_split(idx, self.cv)):
+                    class_folds[k].extend(part.tolist())
+
+            folds = [np.asarray(f, dtype=int) for f in class_folds]
+            meta = np.zeros((len(y), len(self.base_models)), dtype=float)
+
+            for k, val_idx in enumerate(folds):
+                train_idx = np.concatenate(
+                    [folds[j] for j in range(self.cv) if j != k]
+                )
+                for j, model in enumerate(self.base_models):
+                    fitted = copy.deepcopy(model)
+                    self._set_fold_class_weight(fitted, y[train_idx])
+                    fitted.fit(X[train_idx], y[train_idx])
+                    meta[val_idx, j] = fitted.predict_proba(X[val_idx])[:, 1]
+
+            self.meta_model.fit(meta, y)
+
+        else:
+            raise ValueError(
+                "split_strategy must be 'stratified' or 'chronological'."
+            )
+
         self.fitted_base_models_ = []
         for model in self.base_models:
             fitted = copy.deepcopy(model)
+            self._set_fold_class_weight(fitted, y)
             fitted.fit(X, y)
             self.fitted_base_models_.append(fitted)
+
         self.n_features_in_ = X.shape[1]
         return self
 

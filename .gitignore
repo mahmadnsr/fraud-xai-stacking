@@ -17,3 +17,7 @@ __pycache__/
 venv/
 .pytest_cache/
 .coverage
+
+# local editor settings and temporary backups
+.vscode/
+*.bak

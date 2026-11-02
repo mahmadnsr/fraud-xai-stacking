@@ -429,9 +429,22 @@ def run():
                     st.session_state["fraud_version"] = result.version
                     st.session_state["fraud_metrics"] = result.metrics
                     X, y = prepare_xy(bundle.frame, bundle.target)
+                    time_values = None
+                    if cfg.split_strategy == "chronological":
+                        if "Time" not in bundle.frame.columns:
+                            raise ValueError(
+                                "Chronological splitting requires a 'Time' column in the dataset."
+                            )
+                        time_values = bundle.frame["Time"].to_numpy()
+
                     split = split_data(
-                        X, y, cfg.split_strategy,
-                        cfg.val_size, cfg.test_size, cfg.seed,
+                        X,
+                        y,
+                        cfg.split_strategy,
+                        cfg.val_size,
+                        cfg.test_size,
+                        cfg.seed,
+                        time_values=time_values,
                     )
                     st.session_state["fraud_X_test"] = split.X_test
                     st.session_state["fraud_y_test"] = split.y_test
@@ -445,33 +458,65 @@ def run():
     elif page == "Evaluation":
         st.subheader("Model evaluation")
         version_list = list_versions(settings.models_dir)
+
         if not version_list:
             st.warning("No saved model versions are available. Train models first.")
         else:
             default_version = st.session_state["fraud_version"]
-            default_index = version_list.index(default_version) if default_version in version_list else 0
-            version = st.selectbox("Saved model version", version_list, index=default_index)
+            default_index = (
+                version_list.index(default_version)
+                if default_version in version_list else 0
+            )
+            version = st.selectbox(
+                "Saved model version", version_list, index=default_index
+            )
+
             try:
                 loaded = _get_loaded(settings, version)
-                evaluation = st.session_state.get("fraud_metrics") if version == default_version else None
-                if evaluation is None:
-                    st.caption("Showing the evaluation metrics saved with this artifact.")
-                    saved = loaded.evaluation
-                    st.write("Saved evaluation arrays:", list(saved.keys()))
-                    st.dataframe(
-                        pd.DataFrame({
-                            "Evaluation field": list(saved.keys()),
-                            "Shape": [str(np.asarray(v).shape) for v in saved.values()],
-                        }),
-                        use_container_width=True,
+                evaluation = loaded.manifest.get("metrics_test", {})
+                metrics_half = loaded.manifest.get("metrics_test_at_0.5", {})
+                thresholds = loaded.manifest.get("thresholds", {})
+
+                if evaluation:
+                    st.markdown("**Held-out test performance**")
+                    st.caption(
+                        "Metrics use thresholds selected by maximizing F1 "
+                        "on the validation set."
                     )
-                else:
-                    st.dataframe(_metric_table(evaluation), use_container_width=True)
                     metric_frame = _metric_table(evaluation)
+                    st.dataframe(metric_frame, use_container_width=True)
+
                     if "F1" in metric_frame.columns:
-                        chart = metric_frame.set_index("Model")[["F1"]]
-                        st.bar_chart(chart)
+                        st.markdown("**F1 comparison**")
+                        st.bar_chart(
+                            metric_frame.set_index("Model")[["F1"]]
+                        )
+
+                    st.markdown("**Validation-selected decision thresholds**")
+                    threshold_frame = pd.DataFrame([
+                        {
+                            "Model": DISPLAY.get(name, name),
+                            "Threshold": round(float(value), 4),
+                        }
+                        for name, value in thresholds.items()
+                    ])
+                    st.dataframe(
+                        threshold_frame, use_container_width=True
+                    )
+
+                    if metrics_half:
+                        with st.expander("Compare with fixed 0.50 threshold"):
+                            st.dataframe(
+                                _metric_table(metrics_half),
+                                use_container_width=True,
+                            )
+                else:
+                    st.warning(
+                        "This artifact does not contain saved test metrics."
+                    )
+
                 st.caption(f"Artifact version: {loaded.version}")
+
             except Exception as exc:
                 st.error(f"Could not load verified artifact: {exc}")
 
@@ -492,18 +537,32 @@ def run():
                     index=model_names.index("stacking") if "stacking" in model_names else 0,
                 )
                 X_test = st.session_state.get("fraud_X_test")
-                if X_test is None:
+                session_version = st.session_state.get("fraud_version")
+                if X_test is None or session_version != version:
                     st.info(
-                        "The current session has no test rows. Load the dataset "
-                        "and train in this session to enable transaction analysis."
+                        "Transaction-level analysis requires test rows from the "
+                        "same training run as the selected artifact. Select the "
+                        "current session's artifact or load the dataset and train "
+                        "again in this session."
                     )
                 else:
                     row_index = st.number_input(
                         "Test transaction row", min_value=0,
                         max_value=max(0, len(X_test) - 1), value=0, step=1,
                     )
+                    saved_threshold = float(
+                        loaded.manifest.get("thresholds", {}).get(model_name, 0.50)
+                    )
                     threshold = st.slider(
-                        "Fraud decision threshold", 0.05, 0.95, 0.50, 0.01,
+                        "Fraud decision threshold",
+                        min_value=0.01,
+                        max_value=0.99,
+                        value=min(0.99, max(0.01, saved_threshold)),
+                        step=0.01,
+                        help=(
+                            "Defaults to the threshold selected on this artifact's "
+                            "validation set. You can adjust it for interactive analysis."
+                        ),
                     )
                     sample = pd.DataFrame(X_test[[int(row_index)]], columns=loaded.feature_names)
                     st.write("**Input transaction features**")
@@ -536,7 +595,11 @@ def run():
         feature_names = st.session_state.get("fraud_feature_names")
         if not version_list:
             st.warning("Train a model first.")
-        elif X_test is None or feature_names is None:
+        elif (
+            X_test is None
+            or feature_names is None
+            or st.session_state.get("fraud_version") not in version_list
+        ):
             st.info("Load a dataset and train in this session to explain test transactions.")
         else:
             default_version = st.session_state["fraud_version"]
@@ -544,6 +607,14 @@ def run():
             version = st.selectbox("Artifact to explain", version_list, index=default_index)
             try:
                 loaded = _get_loaded(settings, version)
+                if st.session_state.get("fraud_version") != version:
+                    st.info(
+                        "To avoid mixing artifacts and test rows, explanation "
+                        "is enabled only for the model version trained in this session."
+                    )
+                    st.caption(f"Selected artifact: {loaded.version}")
+                    st.stop()
+
                 model_names = list(loaded.models.keys())
                 model_name = st.selectbox("Model to explain", model_names)
                 row_index = st.number_input(

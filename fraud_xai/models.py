@@ -22,6 +22,7 @@ class TrainConfig:
     cv_folds: int = 3       # Fast training ke liye 3 folds
     split_strategy: str = "stratified"
     n_estimators: int = 5   # Fast training ke liye 5 trees
+    meta_scale_pos_weight: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -51,9 +52,14 @@ def build_stacking(cfg: TrainConfig, scale_pos_weight: float) -> ManualStackingC
     base = build_base_models(cfg, scale_pos_weight)
     return ManualStackingClassifier(
         base_models=list(base.values()),
-        meta_model=ManualLogisticRegression(epochs=100),
-        cv=cfg.cv_folds
+        meta_model=ManualLogisticRegression(
+            epochs=100, scale_pos_weight=cfg.meta_scale_pos_weight
+        ),
+        cv=cfg.cv_folds,
+        random_state=cfg.seed,
+        split_strategy=cfg.split_strategy,
     )
+
 
 def describe_params(model) -> dict:
     return {"class": type(model).__name__}

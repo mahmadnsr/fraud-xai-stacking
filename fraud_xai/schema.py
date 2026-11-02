@@ -133,7 +133,11 @@ def validate_training_frame(df: pd.DataFrame, target: str, min_per_class: int = 
         duplicate_rows=int(clean.duplicated().sum()), class_counts=counts,
         fraud_rate=counts[1] / len(clean), warnings=warnings)
     if report.duplicate_rows:
-        warnings.append(f"{report.duplicate_rows} exact duplicate row(s) found; they are removed before splitting to prevent train/test leakage.")
+        warnings.append(
+            f"{report.duplicate_rows} exact duplicate row(s) found. "
+            "They are preserved; duplicate-aware validation is recommended "
+            "because identical rows may occur across data splits."
+        )
     return clean, report
 
 

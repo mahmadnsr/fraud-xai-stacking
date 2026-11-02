@@ -29,6 +29,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--n-estimators", type=int, default=200)
     t.add_argument("--cv-folds", type=int, default=5)
     t.add_argument("--sample-rows", type=int, default=10_000)
+    t.add_argument("--meta-scale-pos-weight", type=float, default=None,
+                   help="Meta-learner positive-class weight; use 1.0 for unweighted.")
     a = ap.parse_args(argv)
     try:
         settings = load_settings()
@@ -48,7 +50,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 bundle = load_synthetic(a.sample_rows, seed=a.seed)
             print(f"Dataset: {bundle.label} | rows={bundle.report.n_rows} fraud={bundle.report.class_counts[1]}")
-            cfg = TrainConfig(seed=a.seed, cv_folds=a.cv_folds, split_strategy=a.split, n_estimators=a.n_estimators)
+            cfg = TrainConfig(seed=a.seed, cv_folds=a.cv_folds,
+                              split_strategy=a.split, n_estimators=a.n_estimators,
+                              meta_scale_pos_weight=a.meta_scale_pos_weight)
             res = train_all(bundle, cfg, settings, progress=print)
             print(f"\nVersion {res.version}. Held-out TEST metrics (threshold chosen on validation):")
             for name, m in res.metrics.items():
